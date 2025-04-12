@@ -1,13 +1,20 @@
-# 📁 experiments/accelerate_train.py
-
 import os
+import sys
+import time
+import json
+from pathlib import Path
+
+# Add project root to Python path
+sys.path.append(str(Path(__file__).parent.parent))
+
+# Third-party imports
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-import time
 import yaml
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # Import Accelerate
 from accelerate import Accelerator
@@ -17,7 +24,15 @@ from accelerate.utils import set_seed
 from models.vit_encoder import ViTEncoder
 from models.siamese import SiameseNetwork
 from utils.dataset import CMFDataset
-from utils.mac_utils import get_device, optimize_memory, recommend_batch_size
+from utils.mac_utils import (
+    get_device, 
+    optimize_memory, 
+    recommend_batch_size, 
+    set_pytorch_threads, 
+    get_mac_info,
+    optimize_memory_for_m_series,
+    get_accelerate_config
+)
 
 def load_config(config_path="config.yaml"):
     """Load configuration from YAML file"""
@@ -30,7 +45,12 @@ def load_config(config_path="config.yaml"):
     return config
 
 def accelerate_train(config_path="config.yaml"):
-    """Train with Accelerate for optimized performance on MacBook Pro"""
+    """
+    Train the model with Accelerate library for optimized performance on Apple Silicon.
+    
+    Args:
+        config_path: Path to the configuration file
+    """
     # Load configuration
     config = load_config(config_path)
     
@@ -40,15 +60,30 @@ def accelerate_train(config_path="config.yaml"):
         "batch_size": None,
         "epochs": 10,
         "learning_rate": 0.0001,
-        "mixed_precision": "fp16",
-        "gradient_accumulation_steps": 4
+        "weight_decay": 1e-5,
+        "early_stopping_patience": 5
     })
-    paths_config = config.get("paths", {"checkpoints": "outputs/checkpoints/"})
+    paths_config = config.get("paths", {
+        "checkpoints": "outputs/checkpoints/",
+        "logs": "logs/"
+    })
+    
+    # Get accelerate config optimized for the current device
+    accelerate_config = get_accelerate_config()
+    
+    # Override with user config if provided
+    if "acceleration" in config:
+        for key, value in config["acceleration"].items():
+            accelerate_config[key] = value
+    
+    # Print accelerate configuration
+    print(f"Accelerate configuration: {accelerate_config}")
     
     # Initialize accelerator
+    # Force mixed_precision to "no" for MPS compatibility
     accelerator = Accelerator(
-        mixed_precision=training_config.get("mixed_precision", "fp16"),
-        gradient_accumulation_steps=training_config.get("gradient_accumulation_steps", 4)
+        mixed_precision="no",
+        gradient_accumulation_steps=accelerate_config["gradient_accumulation_steps"]
     )
     
     # Set seed for reproducibility
@@ -56,6 +91,22 @@ def accelerate_train(config_path="config.yaml"):
     
     # Create output directories
     os.makedirs(paths_config.get("checkpoints", "outputs/checkpoints/"), exist_ok=True)
+    os.makedirs(paths_config.get("logs", "logs/"), exist_ok=True)
+    
+    # Print system information
+    mac_info = get_mac_info()
+    accelerator.print(f"System Information:")
+    for key, value in mac_info.items():
+        accelerator.print(f"  {key}: {value}")
+    
+    # Set PyTorch threads for CPU operations
+    num_threads = set_pytorch_threads()
+    accelerator.print(f"PyTorch using {num_threads} CPU threads")
+    
+    # Optimize memory for M-series Macs
+    if mac_info.get("apple_silicon", False):
+        optimize_memory_for_m_series()
+        accelerator.print("Applied M-series specific memory optimizations")
     
     # Determine batch size if not specified
     batch_size = training_config.get("batch_size")
@@ -64,33 +115,44 @@ def accelerate_train(config_path="config.yaml"):
         accelerator.print(f"Automatically determined batch size: {batch_size}")
     
     # Initialize models
+    accelerator.print("Initializing models...")
     vit = ViTEncoder(pretrained=True)
     siamese = SiameseNetwork()
     
     # Setup dataset
-    full_dataset = CMFDataset(dataset_config.get("path"), training=True)
-    
-    # Split dataset
-    val_size = int(dataset_config.get("validation_split", 0.1) * len(full_dataset))
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=min(4, os.cpu_count() or 1),
-        pin_memory=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=min(4, os.cpu_count() or 1),
-        pin_memory=True
-    )
+    accelerator.print(f"Loading dataset from {dataset_config.get('path')}...")
+    try:
+        full_dataset = CMFDataset(dataset_config.get("path"), training=True)
+        
+        # Split dataset
+        val_size = int(dataset_config.get("validation_split", 0.1) * len(full_dataset))
+        train_size = len(full_dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+        
+        # Create data loaders with optimized settings for M-series
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=min(4, os.cpu_count() or 1),
+            pin_memory=True,
+            persistent_workers=True if os.cpu_count() > 1 else False
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=min(4, os.cpu_count() or 1),
+            pin_memory=True,
+            persistent_workers=True if os.cpu_count() > 1 else False
+        )
+        
+        accelerator.print(f"Dataset loaded with {len(train_dataset)} training and {len(val_dataset)} validation samples")
+        
+    except Exception as e:
+        accelerator.print(f"Error loading dataset: {e}")
+        return
     
     # Loss function and optimizer
     criterion = nn.BCELoss()
@@ -123,6 +185,8 @@ def accelerate_train(config_path="config.yaml"):
     accelerator.print(f"Starting training for {num_epochs} epochs...")
     
     for epoch in range(num_epochs):
+        start_time = time.time()
+        
         # Training phase
         vit.train()
         siamese.train()
@@ -149,10 +213,14 @@ def accelerate_train(config_path="config.yaml"):
                 # Backward pass and optimization
                 accelerator.backward(loss)
                 optimizer.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
             
             # Update progress bar
             progress_bar.set_postfix({"loss": loss.item()})
+            
+            # Periodically free up memory
+            if i % 10 == 0:
+                optimize_memory()
         
         # Calculate epoch stats
         epoch_loss = total_loss / train_samples
@@ -188,11 +256,15 @@ def accelerate_train(config_path="config.yaml"):
         # Update learning rate
         scheduler.step(val_loss)
         
+        # Calculate epoch time
+        epoch_time = time.time() - start_time
+        
         # Print epoch results
         accelerator.print(f"Epoch {epoch+1}/{num_epochs} - "
               f"Train Loss: {epoch_loss:.4f}, "
               f"Val Loss: {val_loss:.4f}, "
-              f"Val Accuracy: {val_accuracy:.4f}")
+              f"Val Accuracy: {val_accuracy:.4f}, "
+              f"Time: {epoch_time:.2f}s")
         
         # Save checkpoint
         if accelerator.is_local_main_process:
@@ -227,11 +299,39 @@ def accelerate_train(config_path="config.yaml"):
                 if patience_counter >= early_stopping_patience:
                     accelerator.print("Early stopping triggered!")
                     break
+            
+            # Save training history
+            with open(os.path.join(paths_config.get("logs"), "training_history.json"), "w") as f:
+                json.dump(history, f)
+            
+            # Plot learning curves
+            plt.figure(figsize=(12, 4))
+            
+            plt.subplot(1, 2, 1)
+            plt.plot(history["train_loss"], label="Train Loss")
+            plt.plot(history["val_loss"], label="Validation Loss")
+            plt.xlabel("Epoch")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.title("Loss Curves")
+            
+            plt.subplot(1, 2, 2)
+            plt.plot(history["val_accuracy"], label="Validation Accuracy")
+            plt.xlabel("Epoch")
+            plt.ylabel("Accuracy")
+            plt.legend()
+            plt.title("Accuracy Curves")
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(paths_config.get("logs"), "learning_curves.png"))
+            plt.close()
         
-        # Clean up memory
+        # Clean up memory before next epoch
         optimize_memory()
     
     accelerator.print(f"Training completed! Best validation loss: {best_val_loss:.4f}")
+    accelerator.print(f"Models saved to {paths_config.get('checkpoints')}")
+    
     return history
 
 if __name__ == "__main__":

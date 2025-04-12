@@ -46,6 +46,13 @@ inference:
   visualization: true
   save_heatmaps: true
 
+# Add this section for Accelerate configuration
+acceleration:
+  mixed_precision: "fp16"  # "fp16", "bf16", or "no"
+  gradient_accumulation_steps: 4
+  enable_accelerate: true  # Toggle to use Accelerate for training
+  cpu_offload: false  # Set to true for memory-constrained systems
+
 # Paths
 paths:
   checkpoints: "outputs/checkpoints/"

@@ -35,17 +35,7 @@ def evaluate(model_path, dataset_path, output_path="outputs/evaluations"):
     # Move models to device
     vit.to(device)
     siamese.to(device)
-    use_accelerate=True):
-    """Evaluate the model with optional Accelerate support"""
     
-    # Use Accelerate if available and requested
-    if use_accelerate:
-        accelerator = Accelerator(mixed_precision="fp16")
-        
-        # Initialize models, move to device, etc.
-        
-        # Prepare model and dataloader
-        vit, siamese, test_loader = accelerator.prepare(vit, siamese, test_loader)
     # Load saved model
     if os.path.exists(model_path):
         print(f"Loading model from {model_path}")
