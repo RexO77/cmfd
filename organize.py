@@ -25,13 +25,24 @@ def organize_dataset(source_dir, dest_dir, train_ratio=0.7, val_ratio=0.15):
     all_files = [f for f in os.listdir(source_dir) if os.path.isfile(os.path.join(source_dir, f)) 
                 and f.endswith(('.png', '.jpg', '.jpeg', '.tif', '.bmp'))]
     
-    # Extract unique image set identifiers
-    image_sets = set()
+    # Group files by their set ID
+    file_groups = {}
     for file in all_files:
         # Extract the base identifier (e.g., "001" from "001_O.png" or "001_F_1.png")
         match = re.match(r'(\d+)_[OMF]', file)
         if match:
-            image_sets.add(match.group(1))
+            set_id = match.group(1)
+            if set_id not in file_groups:
+                file_groups[set_id] = []
+            file_groups[set_id].append(file)
+    
+    # Create list of valid image sets
+    image_sets = []
+    for set_id, files in file_groups.items():
+        original_file = f"{set_id}_O.png"
+        mask_file = f"{set_id}_M.png"
+        if original_file in files and mask_file in files:
+            image_sets.append(set_id)
     
     image_sets = sorted(list(image_sets))
     
@@ -65,18 +76,10 @@ def organize_dataset(source_dir, dest_dir, train_ratio=0.7, val_ratio=0.15):
             os.makedirs(dest_folder, exist_ok=True)
             
             # Find all files for this set
-            set_files = [f for f in all_files if f.startswith(f"{set_id}_")]
+            set_files = file_groups[set_id]
             
             if not set_files:
                 print(f"Warning: No files found for set {set_id}")
-                continue
-                
-            # Check for required files (original + mask at minimum)
-            original_file = f"{set_id}_O.png"
-            mask_file = f"{set_id}_M.png"
-            
-            if original_file not in set_files or mask_file not in set_files:
-                print(f"Warning: Set {set_id} missing required files, skipping")
                 continue
                 
             # Copy all related files
