@@ -4,7 +4,6 @@ dataset:
   validation_split: 0.1
   test_split: 0.2
   num_pairs: 5000
-
 # Model configuration
 model:
   vit_model: "vit_b_16"
