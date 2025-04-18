@@ -10,7 +10,6 @@ def organize_dataset(source_dir, dest_dir, train_ratio=0.7, val_ratio=0.15):
     if not os.path.isdir(source_dir):
         print(f"Error: source directory '{source_dir}' not found")
         return False
-
     # 2. Prepare destination splits
     dest_path = Path(dest_dir)
     splits = {
