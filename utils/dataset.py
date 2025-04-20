@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from utils.transforms import get_transforms
+from PIL import Image
 
 def is_forged(mask_path):
     """Check if the mask contains forgery (non-zero pixels)"""
@@ -16,7 +17,7 @@ def is_forged(mask_path):
     return np.sum(mask) > 0  # Determine if forgery exists
 
 class CMFDataset(Dataset):
-    def __init__(self, root_dir, num_pairs=1000, training=True):
+    def __init__(self, root_dir, num_pairs_per_set=10, training=True): # Changed num_pairs logic
         self.samples = []
         self.transforms = get_transforms(training=training)
         
@@ -28,32 +29,45 @@ class CMFDataset(Dataset):
         
         # Collect sample pairs
         print(f"Loading dataset from {root_dir}...")
+        if not folders:
+             print(f"Warning: No subdirectories found in {root_dir}") # Added warning
+
         for f in folders:
             folder = os.path.join(root_dir, f)
-            imgs = [i for i in os.listdir(folder) if '_F' in i and (i.endswith('.png') or i.endswith('.jpg'))]
             
-            # Skip if no images found
-            if not imgs:
+            original_img_path = os.path.join(folder, f"{f}_O.png")
+            mask_path = os.path.join(folder, f"{f}_M.png")
+            forged_imgs = [os.path.join(folder, i) for i in os.listdir(folder) 
+                           if '_F' in i and i.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+            # Ensure original image exists
+            if not os.path.exists(original_img_path):
+                print(f"Warning: Original image {original_img_path} not found for set {f}. Skipping.")
                 continue
                 
-            mask_path = os.path.join(folder, f"{f}_M.png")
-            label = int(is_forged(mask_path))
+            # Ensure mask exists to determine label (though we might override)
+            if not os.path.exists(mask_path):
+                 print(f"Warning: Mask {mask_path} not found for set {f}. Assuming label 1 for forged images.")
+
+            label = 1 # Label is 1 if we compare Original vs Forged
+
+            # Create pairs: Original vs Forged
+            set_pairs = []
+            if forged_imgs:
+                for forged_img_path in forged_imgs:
+                    set_pairs.append((original_img_path, forged_img_path, label))
             
-            # Create image pairs
-            pairs = []
-            for i in range(len(imgs)):
-                for j in range(i+1, len(imgs)):
-                    pairs.append((os.path.join(folder, imgs[i]),
-                                 os.path.join(folder, imgs[j]), label))
-            
-            # Limit the number of pairs if too many
-            if len(pairs) > num_pairs // len(folders):
-                pairs = random.sample(pairs, num_pairs // len(folders))
+            # Limit pairs per set if needed
+            if len(set_pairs) > num_pairs_per_set:
+                set_pairs = random.sample(set_pairs, num_pairs_per_set)
                 
-            self.samples.extend(pairs)
+            self.samples.extend(set_pairs)
         
+        if not self.samples:
+             print(f"Warning: No valid image pairs found in {root_dir}. Check file naming and structure (_O.png, _F*.png).")
+
         random.shuffle(self.samples)  # Shuffle the sample pairs
-        print(f"Loaded {len(self.samples)} image pairs")
+        print(f"Loaded {len(self.samples)} image pairs from {root_dir}")
 
     def __len__(self):
         return len(self.samples)
@@ -63,17 +77,11 @@ class CMFDataset(Dataset):
         
         # Handle corrupted images
         try:
-            img1 = cv2.imread(img1_path)
-            img2 = cv2.imread(img2_path)
+            # Read images as RGB using PIL instead of OpenCV
+            img1 = Image.open(img1_path).convert('RGB')
+            img2 = Image.open(img2_path).convert('RGB')
             
-            if img1 is None or img2 is None:
-                # Return a placeholder if image reading fails
-                placeholder = np.zeros((224, 224, 3), dtype=np.uint8)
-                return torch.zeros(3, 224, 224), torch.zeros(3, 224, 224), torch.tensor([0], dtype=torch.float32)
-                
-            img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
-            img2 = cv2.cvtColor(img2, cv2.COLOR_BGR2RGB)
-            
+            # Apply transforms (which expect PIL images)
             im1 = self.transforms(img1)
             im2 = self.transforms(img2)
             
