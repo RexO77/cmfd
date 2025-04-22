@@ -15,7 +15,14 @@ from models.siamese import SiameseNetwork
 from utils.transforms import convert_to_tensor
 from utils.heatmap import generate_heatmap, save_heatmap_visualization
 from utils.mac_utils import get_device, optimize_memory
+from utils.frequency_analysis import FrequencyAnalyzer  # Import FrequencyAnalyzer
+from utils.confidence_scoring import calculate_forgery_probability # Updated import
+from utils.region_analysis import cluster_suspicious_pairs, verify_geometric_consistency, compute_spatial_coherence
+from utils.decision_calibration import check_if_authentic, select_optimal_threshold, analyze_image_metrics # Fix imports
 
+def load_models(model_path):
+    """Load saved models"""
+    device = get_device()
 def load_models(model_path):
     """Load saved models"""
     device = get_device()
@@ -130,14 +137,56 @@ def process_window(window, vit, siamese, device, patch_size, stride, threshold, 
         del patch_features_gpu
         torch.mps.empty_cache() if torch.backends.mps.is_available() else None
     
+    # Use frequency domain analysis for any suspicious pairs
+    pair_frequency_metrics = [] # Initialize list to store metrics per pair
+    if suspicious_pairs:
+        # Initialize frequency analyzer
+        frequency_analyzer = FrequencyAnalyzer()
+        
+        # Prepare pairs with local coordinates for analysis
+        local_pairs_for_analysis = [
+            ((x1-x_offset, y1-y_offset), (x2-x_offset, y2-y_offset)) 
+            for (x1, y1), (x2, y2) in suspicious_pairs
+        ]
+        
+        # Run frequency domain analysis (block artifacts, etc.)
+        # This might return metrics applicable to the whole set of pairs in the window
+        freq_region_results = frequency_analyzer.analyze_regions(window, 
+            local_pairs_for_analysis,
+            patch_size)
+        
+        # Analyze frequency bands for each pair individually
+        freq_bands_results = frequency_analyzer.analyze_frequency_bands(window,
+            local_pairs_for_analysis,
+            patch_size)
+        
+        # Structure the results per pair
+        band_similarities_per_pair = freq_bands_results.get('band_similarities', [])
+        
+        for i in range(len(suspicious_pairs)):
+            pair_metrics = {
+                # Add metrics specific to this pair if available
+                'avg_band_similarity': np.mean(band_similarities_per_pair[i]) if i < len(band_similarities_per_pair) and band_similarities_per_pair[i] else 0.0,
+                # Add general metrics from the region analysis (might be the same for all pairs in window)
+                'block_strength': freq_region_results.get('block_strength', 0),
+                'block_periodicity': freq_region_results.get('block_periodicity', 0)
+            }
+            pair_frequency_metrics.append(pair_metrics)
+            
+    # Ensure the returned list has the same length as suspicious_pairs
+    if len(pair_frequency_metrics) != len(suspicious_pairs):
+         # If frequency analysis failed or produced inconsistent results, fill with defaults
+         pair_frequency_metrics = [{'avg_band_similarity': 0.0, 'block_strength': 0, 'block_periodicity': 0}] * len(suspicious_pairs)
+
     return {
         'suspicious_pairs': suspicious_pairs, 
         'similarity_scores': similarity_scores, 
         'patch_coords': patch_coords,
-        'window_indices': window_indices
+        'window_indices': window_indices,
+        'pair_frequency_metrics': pair_frequency_metrics # New list of metrics per pair
     }
 
-def predict(image_path1, image_path2, model_path="outputs/checkpoints/best_model.pt"):
+def predict(image_path1, image_path2, model_path="outputs/checkpoints/most_accuracy_model.pt"):
     """
     Predict similarity between two image patches
     
@@ -181,8 +230,8 @@ def predict(image_path1, image_path2, model_path="outputs/checkpoints/best_model
     
     return float(score.item())
 
-def detect_forgery_window(image_path, model_path="outputs/checkpoints/best_model.pt",
-                  patch_size=64, stride=32, threshold=0.85,
+def detect_forgery_window(image_path, model_path="outputs/checkpoints/most_accuracy_model.pt",
+                  patch_size=64, stride=32, threshold=0.55,
                   output_dir="outputs/predictions",
                   max_dim=512):
     """
@@ -216,6 +265,7 @@ def detect_forgery_window(image_path, model_path="outputs/checkpoints/best_model
     all_suspicious_pairs = []
     all_similarity_scores = []
     all_patch_coords = []
+    all_pair_frequency_metrics = [] # <-- Add list to collect frequency metrics
     
     h, w = img_orig.shape[:2]
     scale_factor = (1, 1)  # No scaling needed
@@ -229,6 +279,7 @@ def detect_forgery_window(image_path, model_path="outputs/checkpoints/best_model
         all_suspicious_pairs = window_results['suspicious_pairs']
         all_similarity_scores = window_results['similarity_scores']
         all_patch_coords = window_results['patch_coords']
+        all_pair_frequency_metrics = window_results['pair_frequency_metrics'] # <-- Collect metrics
     else:
         # For large images, use sliding window approach with overlap
         # Add 50% overlap between windows to catch forgeries at window boundaries
@@ -258,6 +309,7 @@ def detect_forgery_window(image_path, model_path="outputs/checkpoints/best_model
                 all_suspicious_pairs.extend(window_results['suspicious_pairs'])
                 all_similarity_scores.extend(window_results['similarity_scores'])
                 all_patch_coords.extend(window_results['patch_coords'])
+                all_pair_frequency_metrics.extend(window_results['pair_frequency_metrics']) # <-- Collect metrics
                 
                 # Free memory after processing each window
                 optimize_memory()
@@ -297,11 +349,38 @@ def detect_forgery_window(image_path, model_path="outputs/checkpoints/best_model
     # Re-compute suspicious pairs based on validated clusters
     filtered_pairs = []
     filtered_scores = []
+    filtered_frequency_metrics = [] # <-- List for frequency metrics of filtered pairs
+    pair_indices_map = {pair: i for i, pair in enumerate(all_suspicious_pairs)} # Map original pairs to indices
     
     for cluster in validated_clusters:
-        filtered_pairs.extend(cluster['pairs'])
-        filtered_scores.extend(cluster['scores'])
-    
+        for pair, score in zip(cluster['pairs'], cluster['scores']):
+            filtered_pairs.append(pair)
+            filtered_scores.append(score)
+            # Find the corresponding frequency metrics using the original index
+            original_index = pair_indices_map.get(pair)
+            if original_index is not None and original_index < len(all_pair_frequency_metrics):
+                filtered_frequency_metrics.append(all_pair_frequency_metrics[original_index])
+            else:
+                 # Append default if not found (should not happen ideally)
+                 filtered_frequency_metrics.append({'avg_band_similarity': 0.0, 'block_strength': 0, 'block_periodicity': 0})
+
+    # --- Aggregate Frequency Results for calculate_forgery_probability ---
+    aggregated_freq_results = {}
+    if filtered_frequency_metrics:
+        avg_band_similarities = [m.get('avg_band_similarity', 0) for m in filtered_frequency_metrics]
+        block_strengths = [m.get('block_strength', 0) for m in filtered_frequency_metrics]
+        block_periodicities = [m.get('block_periodicity', 0) for m in filtered_frequency_metrics]
+        
+        # Aggregate: Use average values (other strategies like max or median could be used)
+        aggregated_freq_results = {
+            # Note: calculate_forgery_probability expects 'band_similarities' as a list of lists/arrays
+            # We are passing the average per pair here, so the calculation logic might need adjustment
+            # For now, let's pass the list of average band similarities per pair
+            'band_similarities': [[avg] for avg in avg_band_similarities], # Wrap each avg in a list to match expected structure somewhat
+            'block_strength': np.mean(block_strengths) if block_strengths else 0,
+            'block_periodicity': np.mean(block_periodicities) if block_periodicities else 0
+        }
+
     # Convert the filtered pairs to the format needed for heatmap
     processed_pairs = []
     for i, ((x1, y1), (x2, y2)) in enumerate(filtered_pairs):
@@ -363,8 +442,8 @@ def detect_forgery_window(image_path, model_path="outputs/checkpoints/best_model
         "heatmap_path": heatmap_overlay_path
     }
 
-def detect_forgery_dense(image_path, model_path="outputs/checkpoints/best_model.pt",
-                  patch_size=64, stride=32, threshold=0.85,
+def detect_forgery_dense(image_path, model_path="outputs/checkpoints/most_accuracy_model.pt",
+                  patch_size=64, stride=32, threshold=0.55,
                   output_dir="outputs/predictions",
                   max_dim=None):
     """
@@ -394,8 +473,15 @@ def detect_forgery_dense(image_path, model_path="outputs/checkpoints/best_model.
         return {"forgery_probability": 0.0, "forgery_detected": False, "suspicious_pairs": [],
         "heatmap_path": None}
     
+    # Analyze image for authentic or forged detection thresholds
+    # is_likely_authentic = check_if_authentic(img_orig) # Commented out - function missing
+
+    # Use adaptive threshold based on image characteristics
+    # adaptive_threshold = select_optimal_threshold(img_orig, base_threshold=threshold) # Commented out - function missing
+    # threshold = adaptive_threshold  # Override the threshold with the adaptively selected one # Commented out
+
     h_orig, w_orig = img_orig.shape[:2]
-    
+
     # Optional resize (for large images)
     if max_dim and (h_orig > max_dim or w_orig > max_dim):
         scale = max_dim / max(h_orig, w_orig)
@@ -552,6 +638,29 @@ def detect_forgery_dense(image_path, model_path="outputs/checkpoints/best_model.
         except Exception as e:
             print(f"RANSAC filtering error: {e}, using all pairs")
     
+    # --- Add Frequency Analysis for filtered pairs ---
+    freq_results = {}
+    if suspicious_pairs:
+        print(f"Running frequency analysis on {len(suspicious_pairs)} filtered pairs...")
+        frequency_analyzer = FrequencyAnalyzer()
+        
+        # Analyze regions using coordinates relative to img_resized
+        freq_results = frequency_analyzer.analyze_regions(img_resized, 
+            suspicious_pairs, # Pass the filtered pairs directly
+            patch_size)
+        
+        # Analyze frequency bands
+        freq_bands = frequency_analyzer.analyze_frequency_bands(img_resized,
+            suspicious_pairs, # Pass the filtered pairs directly
+            patch_size)
+            
+        # Add band analysis to results
+        freq_results['band_similarities'] = freq_bands.get('band_similarities', [])
+        freq_results['band_visualization'] = freq_bands.get('band_visualization')
+        # Add block artifact info if available
+        freq_results['block_strength'] = freq_results.get('block_strength', 0)
+        freq_results['block_periodicity'] = freq_results.get('block_periodicity', 0)
+
     # Create heatmap
     print(f"Generating heatmap from {len(suspicious_pairs)} suspicious pairs...")
     
@@ -572,27 +681,37 @@ def detect_forgery_dense(image_path, model_path="outputs/checkpoints/best_model.
     overlay = cv2.addWeighted(img_resized, 0.6, heatmap_colored, 0.4, 0)
     
     # Calculate forgery probability based on spatial coherence of suspicious pairs
-    if len(suspicious_pairs) > 0:
-        # Calculate potential non-adjacent pairs
-        total_possible_pairs = (n_patches * (n_patches - 1)) / 2
-        
-        # Calculate raw probability
-        raw_probability = len(suspicious_pairs) / total_possible_pairs
-        
-        # Apply additional weighting based on spatial coherence
-        coherence_score = compute_spatial_coherence(suspicious_pairs, patch_size)
-        forgery_probability = min(1.0, raw_probability * 10 * coherence_score)
-    else:
-        forgery_probability = 0.0
-        coherence_score = 0.0
+    # Pass frequency results to the probability calculation
+    forgery_probability, metrics = calculate_forgery_probability(
+        suspicious_pairs, 
+        similarity_scores, 
+        n_patches, 
+        patch_size,
+        frequency_results=freq_results # Pass frequency results
+    )
     
-    # Decision threshold (can be adjusted based on testing)
-    decision_threshold = 0.3
+    # Adapt decision threshold based on image authenticity characteristics
+    # Images with natural repeating patterns need higher thresholds to avoid false positives
+    # if is_likely_authentic: # Commented out
+    #     decision_threshold = 0.65   # Higher threshold for images with natural pattern characteristics
+    # else: # Commented out
+    #     decision_threshold = 0.40   # Lower threshold for images with forgery characteristics
+    # Use a fixed threshold for now
+    decision_threshold = 0.5 # Fixed threshold
+
+    # Print decision threshold
+    # print(f"  Using decision threshold: {decision_threshold:.4f} (Image {'appears to have natural patterns' if is_likely_authentic else 'lacks natural patterns'})") # Commented out
+    print(f"  Using fixed decision threshold: {decision_threshold:.4f}")
+
+
     forgery_detected = forgery_probability > decision_threshold
-    
+
     # Print debug information
-    print(f"  (Debug: Raw Pairs Ratio={len(suspicious_pairs)/max(1, (n_patches*(n_patches-1)/2)):.6f}, "
-          f"Coherence={coherence_score:.4f}, Final Probability={forgery_probability:.4f})")
+    print(f"  (Debug: Raw Pairs Ratio={metrics['raw_ratio']:.6f}, "
+          f"Coherence={metrics['coherence']:.4f}, Entropy={metrics['entropy']:.4f}, "
+          f"Mode Strength={metrics['mode_strength']:.4f}, Spread={metrics['spread']:.4f}, "
+          f"Freq Score={metrics['frequency_score']:.4f}, " # Add frequency score to debug output
+          f"Final Probability={metrics['probability']:.4f})")
     
     # Save results
     image_name = os.path.basename(image_path).split('.')[0]
@@ -608,8 +727,8 @@ def detect_forgery_dense(image_path, model_path="outputs/checkpoints/best_model.
         "heatmap_path": heatmap_overlay_path
     }
 
-def detect_forgery(image_path, model_path="outputs/checkpoints/best_model.pt",
-                  patch_size=64, stride=32, threshold=0.85,
+def detect_forgery(image_path, model_path="outputs/checkpoints/most_accuracy_model.pt",
+                  patch_size=64, stride=32, threshold=0.55,
                   output_dir="outputs/predictions",
                   max_dim=512):
     """
@@ -637,7 +756,7 @@ def detect_forgery(image_path, model_path="outputs/checkpoints/best_model.pt",
     pixel_count = h * w
     
     # For very large images (>2MP), use sliding window approach
-    if pixel_count > 2000000:
+    if (pixel_count > 2000000):
         print(f"Using sliding window approach for large image ({w}x{h})")
         return detect_forgery_window(image_path, model_path, patch_size, stride, threshold, output_dir, max_dim)
     else:
@@ -646,195 +765,189 @@ def detect_forgery(image_path, model_path="outputs/checkpoints/best_model.pt",
         return detect_forgery_dense(image_path, model_path, patch_size, stride, threshold, output_dir, 
                                   None if max_dim == 0 else max_dim)
 
-def cluster_suspicious_pairs(suspicious_pairs, similarity_scores, patch_size):
+def calculate_offset_distribution(suspicious_pairs):
     """
-    Group suspicious pairs into spatially coherent clusters
+    Calculate statistics about the distribution of offset vectors in suspicious pairs
     
     Args:
-        suspicious_pairs: List of ((x1, y1), (x2, y2)) coordinates for suspicious pairs
-        similarity_scores: List of similarity scores for each pair
-        patch_size: Size of patches
+        suspicious_pairs: List of ((x1, y1), (x2, y2)) coordinate pairs
         
     Returns:
-        clusters: List of dictionaries containing clustered pairs and their statistics
+        dict: Statistical metrics about offset distribution
     """
-    if not suspicious_pairs:
-        return []
-        
-    # Initialize clusters
-    clusters = []
-    visited = set()
+    if len(suspicious_pairs) < 3:
+        return {"entropy": 0, "mode_strength": 0, "spread": 0}
     
-    # Distance threshold for cluster membership - patches should be close to existing cluster
-    distance_threshold = patch_size * 2
-    
-    # Process each suspicious pair
-    for i, ((x1, y1), (x2, y2)) in enumerate(suspicious_pairs):
-        if i in visited:
-            continue
-            
-        # Start a new cluster
-        current_cluster = {
-            'pairs': [((x1, y1), (x2, y2))],
-            'scores': [similarity_scores[i]],
-            'source_coords': [(x1, y1)],
-            'target_coords': [(x2, y2)]
-        }
-        visited.add(i)
-        
-        # Find other pairs that belong to this cluster
-        cluster_changed = True
-        while cluster_changed:
-            cluster_changed = False
-            for j, ((xj1, yj1), (xj2, yj2)) in enumerate(suspicious_pairs):
-                if j in visited:
-                    continue
-                    
-                # Check if this pair connects to any point in the current cluster
-                for sx, sy in current_cluster['source_coords']:
-                    dist1 = np.sqrt((sx - xj1)**2 + (sy - yj1)**2)
-                    dist2 = np.sqrt((sx - xj2)**2 + (sy - yj2)**2)
-                    if min(dist1, dist2) < distance_threshold:
-                        current_cluster['pairs'].append(((xj1, yj1), (xj2, yj2)))
-                        current_cluster['scores'].append(similarity_scores[j])
-                        current_cluster['source_coords'].append((xj1, yj1))
-                        current_cluster['target_coords'].append((xj2, yj2))
-                        visited.add(j)
-                        cluster_changed = True
-                        break
-                        
-                if cluster_changed:
-                    break
-                    
-                # Also check target coords
-                for tx, ty in current_cluster['target_coords']:
-                    dist1 = np.sqrt((tx - xj1)**2 + (ty - yj1)**2)
-                    dist2 = np.sqrt((tx - xj2)**2 + (ty - yj2)**2)
-                    if min(dist1, dist2) < distance_threshold:
-                        current_cluster['pairs'].append(((xj1, yj1), (xj2, yj2)))
-                        current_cluster['scores'].append(similarity_scores[j])
-                        current_cluster['source_coords'].append((xj1, yj1))
-                        current_cluster['target_coords'].append((xj2, yj2))
-                        visited.add(j)
-                        cluster_changed = True
-                        break
-        
-        # Compute cluster statistics
-        current_cluster['size'] = len(current_cluster['pairs'])
-        current_cluster['avg_score'] = np.mean(current_cluster['scores'])
-        current_cluster['max_score'] = np.max(current_cluster['scores'])
-        
-        # Add cluster to results
-        clusters.append(current_cluster)
-    
-    # Sort clusters by size (largest first)
-    clusters.sort(key=lambda c: c['size'], reverse=True)
-    
-    return clusters
-
-def verify_geometric_consistency(cluster, patch_size):
-    """
-    Verify if a cluster shows geometric consistency, indicating a true copy-move operation
-    
-    Args:
-        cluster: Dictionary containing cluster information
-        patch_size: Size of patches
-        
-    Returns:
-        is_valid: Boolean indicating if cluster is geometrically consistent
-        consistency_score: Score representing degree of consistency (0-1)
-    """
-    # Need at least 3 pairs to check consistency
-    if len(cluster['pairs']) < 3:
-        return False, 0.0
-    
-    # Extract source and target points
-    sources = np.array(cluster['source_coords'])
-    targets = np.array(cluster['target_coords'])
-    
-    # Check if they form a coherent group by analyzing offset vectors
-    offsets = targets - sources
-    
-    # Calculate mean and standard deviation of offsets
-    mean_offset = np.mean(offsets, axis=0)
-    std_offset = np.std(offsets, axis=0)
-    
-    # If standard deviation is very small relative to patch size,
-    # this indicates a consistent translation (typical copy-move)
-    offset_consistency = np.mean(std_offset) / patch_size
-    
-    # A true copy-move typically has very consistent offsets
-    # Further relaxed threshold to detect subtle forgeries
-    if offset_consistency < 0.5:  
-        # Calculate consistency score (1 = perfect consistency)
-        consistency_score = 1.0 - min(1.0, offset_consistency * 2)
-        
-        # More relaxed area coverage factor - even smaller regions could be forgeries
-        area_coverage = min(1.0, len(cluster['pairs']) / 8)
-        
-        # Much more relaxed validation threshold
-        is_valid = consistency_score * area_coverage > 0.2
-        return is_valid, consistency_score
-    else:
-        # Also check if it might be a rotation or scaling type forgery
-        src_dists = []
-        tgt_dists = []
-        
-        # Calculate point-to-point distances in source and target
-        for i in range(min(10, len(sources))):
-            for j in range(i+1, min(10, len(sources))):
-                src_dist = np.sqrt(np.sum((sources[i] - sources[j]) ** 2))
-                tgt_dist = np.sqrt(np.sum((targets[i] - targets[j]) ** 2))
-                src_dists.append(src_dist)
-                tgt_dists.append(tgt_dist)
-        
-        # Convert to numpy arrays
-        src_dists = np.array(src_dists)
-        tgt_dists = np.array(tgt_dists)
-        
-        # If distances are preserved (ratio is consistent), it might be a rigid transformation
-        if len(src_dists) > 0:
-            distance_ratios = tgt_dists / (src_dists + 1e-6)
-            ratio_std = np.std(distance_ratios)
-            ratio_consistency = ratio_std / np.mean(distance_ratios)
-            
-            # Further relaxed threshold
-            if ratio_consistency < 0.4:  
-                consistency_score = 1.0 - min(1.0, ratio_consistency * 2.5)
-                area_coverage = min(1.0, len(cluster['pairs']) / 8)
-                # More relaxed validation threshold
-                is_valid = consistency_score * area_coverage > 0.15
-                return is_valid, consistency_score
-    
-    # If we get here, cluster did not pass geometric validation
-    return False, 0.0
-
-def compute_spatial_coherence(pairs, patch_size):
-    """
-    Compute spatial coherence score for suspicious pairs
-    Higher coherence = more likely to be an actual forgery
-    """
-    if len(pairs) < 3:
-        return 0.5  # Not enough pairs to determine coherence
-    
-    # Calculate offset vectors between pairs
+    # Calculate offset vectors
     offsets = []
-    for (x1, y1), (x2, y2) in pairs:
-        offsets.append((x2 - x1, y2 - y1))
+    for (x1, y1), (x2, y2) in suspicious_pairs:
+        offsets.append((x2-x1, y2-y1))
     
-    offsets = np.array(offsets)
+    # Round offsets to integers for better clustering
+    offset_tuples = [(int(round(x)), int(round(y))) for x, y in offsets]
     
-    # Calculate mean and standard deviation of offsets
-    mean_offset = np.mean(offsets, axis=0)
-    std_offset = np.std(offsets, axis=0)
+    # Count frequency of each offset
+    from collections import Counter
+    offset_counts = Counter(offset_tuples)
     
-    # Calculate normalized standard deviation (lower = more coherent)
-    norm_std = np.mean(std_offset) / patch_size
+    # Calculate mode (most common offset)
+    most_common_offset, most_common_count = offset_counts.most_common(1)[0]
+    mode_strength = most_common_count / len(offsets)
     
-    # Convert to coherence score (1 = perfect coherence, 0 = no coherence)
-    coherence = 1.0 - min(1.0, norm_std)
+    # Calculate spread (number of unique offsets relative to total)
+    spread = len(offset_counts) / len(offsets)
     
-    return coherence
+    # Calculate entropy (higher means more random distribution)
+    probs = [count/len(offsets) for count in offset_counts.values()]
+    entropy = -sum(p * np.log2(p) for p in probs)
+    
+    return {
+        "entropy": entropy,
+        "mode_strength": mode_strength,
+        "spread": spread,
+        "most_common_offset": most_common_offset
+    }
+
+def calculate_forgery_probability(suspicious_pairs, similarity_scores, n_patches, patch_size, frequency_results=None): # Add frequency_results parameter
+    """
+    Calculate forgery probability using multiple metrics with special handling for different forgery types,
+    optionally incorporating frequency analysis results.
+    
+    Args:
+        suspicious_pairs: List of coordinate pairs that are suspicious
+        similarity_scores: List of similarity scores for each pair
+        n_patches: Total number of patches in the image
+        patch_size: Size of each patch
+        frequency_results (dict, optional): Results from frequency analysis. Defaults to None.
+        
+    Returns:
+        probability: Final forgery probability
+        metrics: Dictionary of metrics used in calculation
+    """
+    if not suspicious_pairs or len(suspicious_pairs) == 0:
+        # Return default metrics structure even if no pairs
+        return 0.0, {
+            "raw_ratio": 0, "num_pairs": 0, "coherence": 0, "entropy": 0, 
+            "mode_strength": 0, "spread": 0, "structured_score": 0, 
+            "complex_score": 0, "base_score": 0, "frequency_score": 0, 
+            "probability": 0
+        }
+    
+    # 1. Calculate basic metrics
+    total_possible_pairs = (n_patches * (n_patches - 1)) / 2
+    # Avoid division by zero if n_patches is 1 or 0
+    raw_probability = len(suspicious_pairs) / total_possible_pairs if total_possible_pairs > 0 else 0 
+    coherence_score = compute_spatial_coherence(suspicious_pairs, patch_size)
+    
+    # 2. Calculate offset distribution metrics
+    offset_metrics = calculate_offset_distribution(suspicious_pairs)
+    
+    # Calculate raw pair ratio score (scaled for better weighting)
+    # This gives a rough measure of how many suspicious pairs were found relative to possible pairs
+    raw_ratio_score = min(0.3, raw_probability * 25.0)  # Cap at 0.3
+    
+    # Calculate pair count score
+    # More pairs = more likely to be a forgery, with diminishing returns
+    num_pairs = len(suspicious_pairs)
+    pair_count_score = min(0.6, 0.1 * np.log10(1 + num_pairs))  # Log scale with max 0.6
+    
+    # Calculate average similarity score
+    avg_similarity = np.mean(similarity_scores) if similarity_scores else 0
+    similarity_score = avg_similarity * 0.2  # Scale to roughly 0.1-0.2 range
+    
+    # Combine base scores that apply to all forgery types 
+    base_score = raw_ratio_score + pair_count_score + similarity_score
+    
+    # Now consider two possible forgery scenarios:
+    
+    # Scenario 1: Structured copy-move with coherent offsets (classic copy-move)
+    # - Low entropy, high mode strength, low spread
+    structured_indicators = [
+        offset_metrics["mode_strength"] * 1.2,      # Strong primary direction
+        (1 - offset_metrics["spread"]) * 0.8,       # Few different offsets
+        max(0, 1 - (offset_metrics["entropy"] / 4)) * 0.7  # Low entropy
+    ]
+    structured_score = sum(structured_indicators) / (1.2 + 0.8 + 0.7)  # Normalize by sum of weights
+    
+    # Scenario 2: Multiple small forgeries or complex manipulations
+    # - Many suspicious pairs but possibly higher entropy and spread
+    # - We rely more on coherence and raw number of suspicious pairs
+    complex_indicators = [
+        coherence_score * 1.5,                # Spatial coherence
+        min(0.5, num_pairs / 300) * 1.0,      # More pairs = more suspicious
+        min(0.5, raw_probability * 50) * 0.8  # Higher proportion of suspicious pairs
+    ]
+    complex_score = sum(complex_indicators) / (1.5 + 1.0 + 0.8)  # Normalize by sum of weights
+    
+    # Take the maximum score from either forgery scenario 
+    # This lets us detect both classic copy-move and more complex manipulations
+    scenario_score = max(structured_score, complex_score) * 0.6  # Scale to roughly 0-0.6 range
+
+    # --- Add Frequency Analysis Score ---
+    frequency_score = 0.0
+    if frequency_results and isinstance(frequency_results, dict):
+        # Example: Use average band similarity deviation
+        band_similarities = frequency_results.get('band_similarities', [])
+        if band_similarities:
+            # Calculate deviation from expected similarity (e.g., 1.0 for perfect match)
+            # Assuming higher deviation indicates forgery artifacts
+            # avg_band_similarity = np.mean([np.mean(pair_bands) for pair_bands in band_similarities if pair_bands])
+            # Simple score: higher deviation -> higher score (needs tuning)
+            # Let's assume perfect similarity is 1.0. Deviation is abs(1 - avg_band_similarity)
+            # We want to reward *low* similarity in frequency bands for *different* regions
+            # If the regions *are* supposed to be similar (copy-move), frequency mismatch is evidence *against* forgery
+            # Let's rethink: If spatial analysis says "similar", but frequency says "different", maybe it's *not* a copy-move.
+            # If spatial says "similar" AND frequency says "similar", stronger evidence *for* copy-move.
+            
+            # Let's try a different approach: Use block artifact consistency.
+            # If block artifacts are detected and consistent across pairs, it might indicate JPEG compression differences.
+            block_strength = frequency_results.get('block_strength', 0)
+            block_periodicity = frequency_results.get('block_periodicity', 0)
+            
+            # Simple score based on block artifacts (needs tuning)
+            # Strong, periodic block artifacts might indicate inconsistent compression
+            block_artifact_score = min(0.2, (block_strength * block_periodicity) * 5.0) 
+            
+            # Use band similarity consistency. If pairs are truly copied, their band similarities should be high.
+            # Let's calculate the average similarity across all bands for each pair
+            # Note: band_similarities might be a list of lists (bands per pair) or list of averages (avg per pair)
+            avg_pair_band_sims = []
+            for pair_bands in band_similarities:
+                if isinstance(pair_bands, (list, np.ndarray)) and len(pair_bands) > 0:
+                    avg_pair_band_sims.append(np.mean(pair_bands))
+                elif isinstance(pair_bands, (int, float)): # Handle case where it's already an average
+                    avg_pair_band_sims.append(pair_bands)
+
+            if avg_pair_band_sims:
+                 # Average similarity across all pairs' frequency bands
+                overall_avg_band_sim = np.mean(avg_pair_band_sims)
+                # Score increases as average band similarity increases (more evidence for copy-move)
+                band_consistency_score = min(0.3, overall_avg_band_sim * 0.3) 
+            else:
+                band_consistency_score = 0.0
+
+            frequency_score = block_artifact_score + band_consistency_score
+            frequency_score = min(0.4, frequency_score) # Cap frequency contribution
+
+    # Final probability = base score + best scenario score + frequency score
+    forgery_probability = base_score + scenario_score + frequency_score # Add frequency_score
+    forgery_probability = min(1.0, forgery_probability)  # Cap at 1.0
+    
+    metrics = {
+        "raw_ratio": raw_probability,
+        "num_pairs": num_pairs,
+        "coherence": coherence_score,
+        "entropy": offset_metrics["entropy"],
+        "mode_strength": offset_metrics["mode_strength"],
+        "spread": offset_metrics["spread"],
+        "structured_score": structured_score,
+        "complex_score": complex_score,
+        "base_score": base_score,
+        "frequency_score": frequency_score, # Add frequency score to metrics
+        "probability": forgery_probability
+    }
+    
+    return forgery_probability, metrics
 
 if __name__ == "__main__":
     import argparse
@@ -847,11 +960,11 @@ if __name__ == "__main__":
     parser.add_argument('--image2', type=str, help="Path to the second image (for predict mode)")
     # --- Keep existing arguments for detect mode ---
     parser.add_argument('--image', type=str, help="Path to the image (for detect mode)")
-    parser.add_argument('--model', type=str, default="outputs/checkpoints/best_model.pt", help="Path to the model")
+    parser.add_argument('--model', type=str, default="outputs/checkpoints/most_accuracy_model.pt", help="Path to the trained model checkpoint") # Changed default model
     parser.add_argument('--output', type=str, default="outputs/predictions", help="Output directory (for detect mode)")
     parser.add_argument('--patch_size', type=int, default=64, help="Patch size (for detect mode)")
     parser.add_argument('--stride', type=int, default=32, help="Stride between patches (for detect mode)")
-    parser.add_argument('--threshold', type=float, default=0.85, help="Threshold for similarity (for detect mode)") 
+    parser.add_argument('--threshold', type=float, default=0.55, help="Threshold for similarity (for detect mode)") 
     parser.add_argument('--max_dim', type=int, default=512, help="Maximum dimension for image resizing (for detect mode, use 0 or None to disable)")
     parser.add_argument('--use_dense', action='store_true', help="Use dense feature matching instead of sliding window")
     
@@ -869,7 +982,7 @@ if __name__ == "__main__":
         )
         print(f"\nComparing '{os.path.basename(args.image1)}' and '{os.path.basename(args.image2)}':")
         print(f"  Similarity Score: {similarity_score:.4f}")
-        if similarity_score > 0.5: # Using 0.5 as the threshold based on training/eval
+        if (similarity_score > 0.5): # Using 0.5 as the threshold based on training/eval
              print("  Result: Likely a FORGED pair (score > 0.5)")
         else:
              print("  Result: Likely an ORIGINAL pair (score <= 0.5)")
@@ -897,3 +1010,4 @@ if __name__ == "__main__":
         print(f"  Number of suspicious pairs: {len(result.get('suspicious_pairs',[]))}")
         if 'heatmap_path' in result and result['heatmap_path']:
             print(f"  Heatmap saved to: {result['heatmap_path']}")
+

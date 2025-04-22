@@ -1,3 +1,9 @@
+import sys # Move sys import up
+from pathlib import Path # Move Path import up
+
+# Add project root to Python path (MUST be before other project imports)
+sys.path.append(str(Path(__file__).parent.parent))
+
 import os
 import torch
 import numpy as np
@@ -14,12 +20,12 @@ from accelerate import Accelerator
 
 def evaluate(model_path, dataset_path, output_path="outputs/evaluations"):
     """
-    Evaluate the model on the test dataset
-    
+    Evaluates the model on the test dataset.
+
     Args:
-        model_path: Path to the saved model
-        dataset_path: Path to the test dataset
-        output_path: Path to save evaluation results
+        model_path (str): Path to the model checkpoint.
+        dataset_path (str): Path to the *test* dataset directory.
+        output_path (str): Directory to save evaluation results.
     """
     # Create output directory
     os.makedirs(output_path, exist_ok=True)
@@ -47,8 +53,14 @@ def evaluate(model_path, dataset_path, output_path="outputs/evaluations"):
         print(f"Model not found at {model_path}")
         return
     
-    # Load test dataset
-    test_dataset = CMFDataset(dataset_path, training=False)
+    # Load test dataset - dataset_path should point directly to the test split
+    print(f"Loading test dataset from: {dataset_path}")
+    test_dataset = CMFDataset(dataset_path, training=False) # Assumes dataset_path is the test split dir
+    if not test_dataset.samples:
+        print(f"Error: No samples found in the test dataset path: {dataset_path}")
+        print("Please ensure the path points to the directory containing image set folders (e.g., data/CoMoFoD_small_v2/test).")
+        return
+    
     batch_size = recommend_batch_size()
     test_loader = DataLoader(
         test_dataset, 
@@ -94,11 +106,26 @@ def evaluate(model_path, dataset_path, output_path="outputs/evaluations"):
     # Calculate metrics
     metrics = compute_classification_metrics(all_labels, all_preds)
     
+    # --- Calculate Average Confidence for Correct Predictions ---
+    true_positives = (all_preds > 0.5) & (all_labels == 1)
+    true_negatives = (all_preds <= 0.5) & (all_labels == 0)
+    
+    avg_conf_tp = np.mean(all_preds[true_positives]) if np.any(true_positives) else np.nan
+    # For TN, confidence is (1 - pred_score), but let's report avg raw score for simplicity
+    avg_score_tn = np.mean(all_preds[true_negatives]) if np.any(true_negatives) else np.nan 
+    # --- End Calculate Average Confidence ---
+
     # Print results
-    print("\nEvaluation Results:")
+    print("\nEvaluation Results (using threshold=0.5):") # Clarify threshold
     for metric, value in metrics.items():
         print(f"  {metric}: {value:.4f}")
     
+    # --- Print Average Confidence --- 
+    print(f"\n  Avg. Prediction Score (Confidence) for Correctly Identified Forged (TP): {avg_conf_tp:.4f}")
+    print(f"  Avg. Prediction Score for Correctly Identified Original (TN): {avg_score_tn:.4f}")
+    print("\nNote: Detailed prediction scores (percentages) for each sample are in outputs/evaluations/results.csv")
+    # --- End Print Average Confidence ---
+
     # Plot precision-recall curve
     plt.figure(figsize=(10, 4))
     
@@ -174,11 +201,11 @@ def evaluate(model_path, dataset_path, output_path="outputs/evaluations"):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Evaluate Copy-Move Forgery Detection Model")
-    parser.add_argument('--model', type=str, default="outputs/checkpoints/best_model.pt", 
-                        help="Path to the saved model")
-    parser.add_argument('--dataset', type=str, default="data/CoMoFoD_small_v2", 
-                        help="Path to the test dataset")
+    parser = argparse.ArgumentParser(description="Evaluate the CMFD model")
+    parser.add_argument('--model', type=str, default="outputs/checkpoints/most_accuracy_model.pt", 
+                        help="Path to the trained model checkpoint")
+    parser.add_argument('--dataset', type=str, default="data/CoMoFoD_small_v2/test", 
+                        help="Path to the *test* dataset directory")
     parser.add_argument('--output', type=str, default="outputs/evaluations", 
                         help="Path to save evaluation results")
     
