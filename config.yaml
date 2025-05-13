@@ -1,0 +1,61 @@
+# Dataset configuration
+dataset:
+  path: "data/CoMoFoD_small_v2"
+  validation_split: 0.1
+  test_split: 0.2
+  num_pairs: 5000
+  
+# Model configuration
+model:
+  vit_model: "vit_b_16"
+  feature_dim: 768
+  freeze_layers: true
+  siamese_hidden_dims: [512, 128]
+  dropout: 0.3
+
+# Training configuration
+training:
+  batch_size: null  # Auto-detect based on system memory
+  epochs: 10
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  early_stopping_patience: 5
+  log_interval: 10
+  
+  # Acceleration options
+  mixed_precision: true
+  gradient_accumulation_steps: 4
+  use_accelerate: true
+
+# MacOS specific optimizations
+mac_optimizations:
+  use_mps: true  # Use Metal Performance Shaders if available
+  memory_fraction: 0.8  # Control memory allocation on MPS
+  cpu_threads: null  # Auto-detect optimal thread count
+
+# Evaluation configuration
+evaluation:
+  threshold: 0.7
+  metrics: ["accuracy", "precision", "recall", "f1", "auc"]
+
+# Inference configuration
+inference:
+  patch_size: 64
+  stride: 32
+  threshold: 0.85
+  visualization: true
+  save_heatmaps: true
+
+# Add this section for Accelerate configuration
+acceleration:
+  mixed_precision: "fp16"  # "fp16", "bf16", or "no"
+  gradient_accumulation_steps: 4
+  enable_accelerate: true  # Toggle to use Accelerate for training
+  cpu_offload: false  # Set to true for memory-constrained systems
+
+# Paths
+paths:
+  checkpoints: "outputs/checkpoints/"
+  logs: "logs/"
+  predictions: "outputs/predictions/"
+  visualizations: "outputs/visualizations/"

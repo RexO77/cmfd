@@ -1,0 +1,27 @@
+# Core libraries
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+timm>=0.9.0  # For Vision Transformer models
+
+# Training optimization
+accelerate>=0.23.0  # For mixed precision and optimized training
+tqdm>=4.65.0
+tensorboard>=2.12.0
+pyyaml>=6.0
+
+# Evaluation and metrics
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
+
+# Memory optimization
+psutil>=5.9.0
+
+# UI components
+streamlit>=1.22.0
+plotly>=5.14.0
+
+# MacOS specific optimizations
+# No special packages needed - MPS backend is included in PyTorch

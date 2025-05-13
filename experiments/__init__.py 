@@ -1,0 +1,52 @@
+"""
+Experimental pipelines for the Copy-Move Forgery Detection project.
+This module provides access to training, evaluation, and inference functions
+optimized for MacOS environments.
+"""
+
+# Import experiment functions
+from experiments.train import train
+from experiments.eval import evaluate
+from experiments.infer import predict, detect_forgery, load_models
+
+# Optional: Import Accelerate integration if available
+try:
+    from experiments.accelerate_train import accelerate_train
+    HAS_ACCELERATE = True
+except ImportError:
+    HAS_ACCELERATE = False
+
+# Module exports
+__all__ = [
+    # Training functions
+    'train',
+    
+    # Evaluation functions
+    'evaluate',
+    
+    # Inference functions
+    'predict', 
+    'detect_forgery', 
+    'load_models'
+]
+
+# Add accelerate training if available
+if HAS_ACCELERATE:
+    __all__.append('accelerate_train')
+
+# Package information
+__version__ = '1.0.0'
+
+def get_available_experiments():
+    """Returns a list of available experiment functions"""
+    experiments = {
+        'train': 'Train the model with standard PyTorch',
+        'evaluate': 'Evaluate model performance on test data',
+        'predict': 'Compare similarity between two images',
+        'detect_forgery': 'Detect forgery in a single image'
+    }
+    
+    if HAS_ACCELERATE:
+        experiments['accelerate_train'] = 'Train with Accelerate for faster performance'
+        
+    return experiments

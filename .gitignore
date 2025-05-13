@@ -1,0 +1,13 @@
+# Large data directories
+/data/
+/outputs/
+
+# Virtual environment
+/cmfd-env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
